@@ -258,6 +258,56 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)
                 self._chdir(self.work_dir)
 
+    def patch_shell_root(self):
+        """将 allow_shell 默认值改为 true，使 shell (UID 2000) 始终拥有 root 权限"""
+        logger.info("=== 设置 Shell Root (UID 2000 默认 root) ===")
+
+        # 搜索所有可能的 init.c 路径
+        candidates = [
+            self.work_dir / "KernelSU/kernel/core/init.c",
+            self.work_dir / "common/drivers/kernelsu/core/init.c",
+        ]
+        # 也通过 glob 兜底搜索
+        for p in self.work_dir.glob("**/core/init.c"):
+            if "kernelsu" in str(p).lower() or "KernelSU" in str(p):
+                candidates.append(p)
+
+        init_c = None
+        for c in candidates:
+            logger.info(f"  检查路径: {c} -> {'存在' if c.exists() else '不存在'}")
+            if c.exists() and init_c is None:
+                init_c = c
+
+        if not init_c:
+            logger.warning("未找到 KernelSU init.c，跳过 Shell Root 补丁")
+            return
+
+        logger.info(f"  使用: {init_c}")
+        with open(init_c, "r") as f:
+            content = f.read()
+
+        old_block = (
+            '#ifdef CONFIG_KSU_DEBUG\n'
+            'bool allow_shell = true;\n'
+            '#else\n'
+            'bool allow_shell = false;\n'
+            '#endif'
+        )
+
+        if old_block in content:
+            content = content.replace(old_block, 'bool allow_shell = true;')
+            with open(init_c, "w") as f:
+                f.write(content)
+            logger.info("Shell Root: allow_shell 已设为始终 true (UID 2000 默认 root)")
+        elif 'bool allow_shell = true;' in content:
+            logger.info("Shell Root: allow_shell 已经是 true，无需修改")
+        else:
+            logger.warning("Shell Root: 未找到 allow_shell 定义块，跳过")
+            # 打印相关行帮助调试
+            for line in content.split('\n'):
+                if 'allow_shell' in line:
+                    logger.warning(f"  找到相关行: {line.strip()}")
+
     def add_bbg(self):
         if not self.config.use_bbg:
             return
@@ -713,6 +763,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.init_and_sync_kernel()
             self.add_kernel_supatch()
             self.add_kernelsu()
+            self.patch_shell_root()
             self.add_bbg()
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
