@@ -192,7 +192,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir)
         formatted_branch = self.config.formatted_branch
 
-        self._run_cmd(f"$REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest "
+        self._run_cmd(f"$REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest "
                      f"-b common-{formatted_branch} --repo-rev=v2.16", check=False)
 
         remote = subprocess.run(f"git ls-remote https://android.googlesource.com/kernel/common {formatted_branch}",
@@ -337,6 +337,13 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         fb = f"{self.config.android_version}-{self.config.kernel_version}"
         with open(task_mmu, "r") as f:
             content = f.read()
+
+        # 修复 SUSFS 补丁引入的 dentry 未初始化警告（-Werror 会导致编译失败）
+        if "struct dentry *dentry;" in content and "struct dentry *dentry = NULL;" not in content:
+            content = content.replace("struct dentry *dentry;", "struct dentry *dentry = NULL;")
+            with open(task_mmu, "w") as f:
+                f.write(content)
+            logger.info("已修复 task_mmu.c: dentry 初始化为 NULL")
 
         if fb == "android15-6.6" and "unsigned int nr_subpages" not in content:
             self._fix_base_c_header()

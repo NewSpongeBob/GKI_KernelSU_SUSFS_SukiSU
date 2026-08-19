@@ -176,8 +176,8 @@ jobs:
         id: prepare-artifacts
         run: |
           mkdir -p artifacts
-          find /tmp/gki-build -name "*.zip" -type f -exec cp {} artifacts/ \;
-          find /tmp/gki-build -name "*.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "android*-AnyKernel3*.zip" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "android*-boot*.img" -type f -exec cp {} artifacts/ \;
           if [ -z "$(ls -A artifacts/)" ]; then
             echo "没有找到构建产物"
             echo "artifacts_exist=false" >> $GITHUB_OUTPUT

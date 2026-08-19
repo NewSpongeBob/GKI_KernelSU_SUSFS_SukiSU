@@ -94,12 +94,12 @@ on:
         description: '创建 GitHub Release'
         required: true
         type: boolean
-        default: true
+        default: false
       send_telegram:
         description: '发送 Telegram 通知'
         required: true
         type: boolean
-        default: true
+        default: false
 
 env:
   PYTHON_VERSION: '3.10'
@@ -176,8 +176,8 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir -p artifacts
-          find /tmp/gki-build -name "*.zip" -type f -exec cp {} artifacts/ \;
-          find /tmp/gki-build -name "*.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "android*-AnyKernel3*.zip" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "android*-boot*.img" -type f -exec cp {} artifacts/ \;
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
