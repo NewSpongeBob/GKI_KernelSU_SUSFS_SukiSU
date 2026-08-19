@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--op8e", action="store_true")
     parser.add_argument("--bbr", action="store_true")
     parser.add_argument("--no-release", action="store_true")
+    parser.add_argument("--build-time", dest="build_time",
+                        default=os.environ.get('BUILD_TIME') or None,
+                        help="自定义构建时间 (也可通过环境变量 BUILD_TIME 传入)")
     parser.add_argument("--custom-version", dest="custom_version", default=None)
     parser.add_argument("--revision")
     parser.add_argument("--matrix", "-m")
@@ -98,6 +101,7 @@ def create_build_config(args: argparse.Namespace) -> BuildConfig:
         make_release=not args.no_release,
         custom_version=args.custom_version,
         revision=args.revision,
+        build_time=args.build_time,
     )
 
 
@@ -163,6 +167,7 @@ def build_matrix(matrix_key: str, args: argparse.Namespace, workspace: str) -> l
                 make_release=not args.no_release,
                 custom_version=args.custom_version,
                 revision=cfg_data.get("revision"),
+                build_time=args.build_time,
             )
 
             logger.info(f"\n{'=' * 60}\n构建配置: {config.config_name}\n{'=' * 60}")

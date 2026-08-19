@@ -463,7 +463,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                     f.write(content)
 
         import datetime
-        current_time = datetime.datetime.utcnow().strftime("%a %b %d %H:%M:%S UTC %Y")
+        if self.config.build_time:
+            current_time = self.config.build_time
+            logger.info(f"使用自定义构建时间: {current_time}")
+        else:
+            current_time = datetime.datetime.utcnow().strftime("%a %b %d %H:%M:%S UTC %Y")
+            logger.info(f"使用当前 UTC 时间: {current_time}")
         mkcompile_h = self.work_dir / "common/scripts/mkcompile_h"
         if mkcompile_h.exists():
             with open(mkcompile_h, "r") as f:
