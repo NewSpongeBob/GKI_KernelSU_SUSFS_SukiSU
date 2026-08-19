@@ -262,30 +262,31 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         """将 allow_shell 默认值改为 true，使 shell (UID 2000) 始终拥有 root 权限"""
         logger.info("=== 设置 Shell Root (UID 2000 默认 root) ===")
 
-        # 搜索所有可能的 init.c 路径
-        candidates = [
-            self.work_dir / "KernelSU/kernel/core/init.c",
-            self.work_dir / "common/drivers/kernelsu/core/init.c",
-        ]
-        # 也通过 glob 兜底搜索
-        for p in self.work_dir.glob("**/core/init.c"):
-            if "kernelsu" in str(p).lower() or "KernelSU" in str(p):
-                candidates.append(p)
+        # 用 grep 搜索含 allow_shell 的 .c 文件（兼容所有目录结构）
+        target_file = None
+        for search_dir in [
+            self.work_dir / "KernelSU",
+            self.work_dir / "common/drivers/kernelsu",
+        ]:
+            if not search_dir.exists():
+                continue
+            result = subprocess.run(
+                f"grep -rl --include='*.c' 'allow_shell' {search_dir} 2>/dev/null",
+                shell=True, capture_output=True, text=True)
+            files = [p for p in result.stdout.strip().split('\n') if p]
+            if files:
+                target_file = Path(files[0])
+                break
 
-        init_c = None
-        for c in candidates:
-            logger.info(f"  检查路径: {c} -> {'存在' if c.exists() else '不存在'}")
-            if c.exists() and init_c is None:
-                init_c = c
-
-        if not init_c:
-            logger.warning("未找到 KernelSU init.c，跳过 Shell Root 补丁")
+        if target_file:
+            logger.info(f"  找到 allow_shell 定义: {target_file}")
+        else:
+            logger.warning("未找到含 allow_shell 的源文件，跳过 Shell Root 补丁")
             return
-
-        logger.info(f"  使用: {init_c}")
-        with open(init_c, "r") as f:
+        with open(target_file, "r") as f:
             content = f.read()
 
+        # 匹配多种写法
         old_block = (
             '#ifdef CONFIG_KSU_DEBUG\n'
             'bool allow_shell = true;\n'
@@ -293,17 +294,24 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             'bool allow_shell = false;\n'
             '#endif'
         )
+        is_enabled_pattern = 'bool allow_shell = IS_ENABLED(CONFIG_KSU_DEBUG);'
 
+        modified = False
         if old_block in content:
             content = content.replace(old_block, 'bool allow_shell = true;')
-            with open(init_c, "w") as f:
+            modified = True
+        elif is_enabled_pattern in content:
+            content = content.replace(is_enabled_pattern, 'bool allow_shell = true;')
+            modified = True
+
+        if modified:
+            with open(target_file, "w") as f:
                 f.write(content)
             logger.info("Shell Root: allow_shell 已设为始终 true (UID 2000 默认 root)")
         elif 'bool allow_shell = true;' in content:
             logger.info("Shell Root: allow_shell 已经是 true，无需修改")
         else:
-            logger.warning("Shell Root: 未找到 allow_shell 定义块，跳过")
-            # 打印相关行帮助调试
+            logger.warning("Shell Root: 未找到 allow_shell 定义，跳过")
             for line in content.split('\n'):
                 if 'allow_shell' in line:
                     logger.warning(f"  找到相关行: {line.strip()}")
@@ -494,23 +502,52 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         safe_custom_version = ""
         if self.config.custom_version:
             safe_custom_version = self.config.custom_version.rstrip('-')[:MAX_CUSTOM_LEN]
+            logger.info(f"使用自定义构建版本: {safe_custom_version}")
+        else:
+            logger.info("使用默认构建版本")
+
+        is_bazel = not (self.work_dir / "build/build.sh").exists()
 
         setlocalversion = self.work_dir / "common/scripts/setlocalversion"
-        if setlocalversion.exists():
-            with open(setlocalversion, "r") as f:
-                content = f.read()
-            if safe_custom_version:
-                lines = content.split('\n')
-                for i, line in enumerate(lines):
-                    if 'echo "$res"' in line and not line.strip().startswith('#'):
-                        lines[i] = f'\techo "{safe_custom_version}$res"'
-                        break
-                with open(setlocalversion, "w") as f:
-                    f.write('\n'.join(lines))
-            if "-dirty" in content:
-                content = content.replace("-dirty", "")
-                with open(setlocalversion, "w") as f:
-                    f.write(content)
+        defconfig = self.work_dir / "common/arch/arm64/configs/gki_defconfig"
+
+        if is_bazel:
+            # bazel 构建：去掉 -dirty 在 stamp.bzl 层处理
+            pass
+        else:
+            # build.sh 构建：去掉 -dirty
+            if setlocalversion.exists():
+                self._run_cmd(f"sed -i 's/-dirty//' {setlocalversion}", check=False)
+
+        # 配置 custom_version（参照 ReSukiSu 的方式，用 sed 直接操作）
+        if safe_custom_version:
+            kv = self.config.kernel_version
+            if kv in ["5.10", "5.15"]:
+                # 5.x：旧格式 setlocalversion
+                self._run_cmd(
+                    f'''sed -i "\\$s|echo \\"\\$res\\"|echo \\"{safe_custom_version}\\"|" {setlocalversion}''',
+                    check=False)
+                self._run_cmd(
+                    f'''sed -i '/^CONFIG_LOCALVERSION=/ s/="[^"]*"/="{safe_custom_version}"/' {defconfig}''',
+                    check=False)
+            elif kv == "6.1":
+                # 6.1：旧格式 setlocalversion + CONFIG_LOCALVERSION
+                self._run_cmd(
+                    f'''sed -i "\\$s|echo \\"\\$res\\"|echo \\"{safe_custom_version}\\"|" {setlocalversion}''',
+                    check=False)
+                self._run_cmd(
+                    f'''sed -i '/^CONFIG_LOCALVERSION=/ s/="[^"]*"/="{safe_custom_version}"/' {defconfig}''',
+                    check=False)
+            else:
+                # 6.6+：新格式 setlocalversion
+                self._run_cmd(
+                    f"""perl -i -0777 -pe 's/(.*)echo "\\${{KERNELVERSION}}\\${{file_localversion}}\\${{config_localversion}}\\${{LOCALVERSION}}\\${{scm_version}}"/$1echo "\\${{KERNELVERSION}}{safe_custom_version}"/s' {setlocalversion}""",
+                    check=False)
+            logger.info(f"已通过 setlocalversion 注入版本: {safe_custom_version}")
+        else:
+            # 无自定义版本时，仅去掉 -dirty
+            if setlocalversion.exists() and is_bazel:
+                self._run_cmd(f"sed -i 's/-dirty//' {setlocalversion}", check=False)
 
         import datetime
         if self.config.build_time:
@@ -537,7 +574,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 with open(init_makefile, "w") as f:
                     f.write(content)
 
-        if not (self.work_dir / "build/build.sh").exists():
+        if is_bazel:
             bazel_build = self.work_dir / "common/BUILD.bazel"
             if bazel_build.exists():
                 with open(bazel_build, "r") as f:
@@ -565,16 +602,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 with open(stamp_bzl, "w") as f:
                     f.write(content)
 
-            if self.config.custom_version:
-                config_file = self.work_dir / "common/arch/arm64/configs/gki_defconfig"
-                if config_file.exists():
-                    with open(config_file, "r") as f:
-                        content = f.read()
-                    content = re.sub(r'^CONFIG_LOCALVERSION=".*"$', f'CONFIG_LOCALVERSION="{self.config.custom_version}"', content, flags=re.MULTILINE)
-                    with open(config_file, "w") as f:
-                        f.write(content)
-                else:
-                    logger.warning(f"配置文件不存在，跳过 custom_version 设置: {config_file}")
+            # custom_version 已通过 setlocalversion + CONFIG_LOCALVERSION 注入
 
     def show_kernel_config(self):
         logger.info("=== 显示内核配置列表 ===")
