@@ -262,59 +262,280 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         """将 allow_shell 默认值改为 true，使 shell (UID 2000) 始终拥有 root 权限"""
         logger.info("=== 设置 Shell Root (UID 2000 默认 root) ===")
 
-        # 用 grep 搜索含 allow_shell 的 .c 文件（兼容所有目录结构）
+        # 优先搜索编译路径（common/drivers/kernelsu），确保修改的是 build system 实际编译的文件
         target_file = None
         for search_dir in [
-            self.work_dir / "KernelSU",
             self.work_dir / "common/drivers/kernelsu",
+            self.work_dir / "KernelSU",
         ]:
             if not search_dir.exists():
                 continue
             result = subprocess.run(
-                f"grep -rl --include='*.c' 'allow_shell' {search_dir} 2>/dev/null",
+                f"grep -rl --include='*.c' 'bool allow_shell' {search_dir} 2>/dev/null",
                 shell=True, capture_output=True, text=True)
             files = [p for p in result.stdout.strip().split('\n') if p]
             if files:
                 target_file = Path(files[0])
                 break
 
-        if target_file:
-            logger.info(f"  找到 allow_shell 定义: {target_file}")
-        else:
-            logger.warning("未找到含 allow_shell 的源文件，跳过 Shell Root 补丁")
+        if not target_file:
+            logger.warning("未找到 allow_shell 定义文件，跳过 Shell Root 补丁")
             return
+
+        logger.info(f"  找到 allow_shell 定义: {target_file}")
+
+        # 读取 → Python 替换 → 写回（不依赖 sed，最可靠）
         with open(target_file, "r") as f:
             content = f.read()
 
-        # 匹配多种写法
-        old_block = (
-            '#ifdef CONFIG_KSU_DEBUG\n'
-            'bool allow_shell = true;\n'
-            '#else\n'
-            'bool allow_shell = false;\n'
-            '#endif'
-        )
-        is_enabled_pattern = 'bool allow_shell = IS_ENABLED(CONFIG_KSU_DEBUG);'
+        logger.info(f"  修改前 allow_shell 行:")
+        for line in content.split('\n'):
+            if 'allow_shell' in line and 'bool' in line:
+                logger.info(f"    | {line}")
 
-        modified = False
-        if old_block in content:
-            content = content.replace(old_block, 'bool allow_shell = true;')
-            modified = True
-        elif is_enabled_pattern in content:
-            content = content.replace(is_enabled_pattern, 'bool allow_shell = true;')
-            modified = True
+        new_content = content
+        # 处理 IS_ENABLED(...) 写法（正则匹配）
+        new_content = re.sub(
+            r'bool allow_shell\s*=\s*IS_ENABLED\([^)]*\)\s*;',
+            'bool allow_shell = true;',
+            new_content)
+        # 处理 = false 写法
+        new_content = new_content.replace('bool allow_shell = false;', 'bool allow_shell = true;')
 
-        if modified:
+        if new_content != content:
             with open(target_file, "w") as f:
-                f.write(content)
-            logger.info("Shell Root: allow_shell 已设为始终 true (UID 2000 默认 root)")
+                f.write(new_content)
+            logger.info("Shell Root: 文件已写入")
         elif 'bool allow_shell = true;' in content:
             logger.info("Shell Root: allow_shell 已经是 true，无需修改")
+            return
         else:
-            logger.warning("Shell Root: 未找到 allow_shell 定义，跳过")
+            logger.warning("Shell Root: 未匹配到任何已知的 allow_shell 定义模式")
+            return
+
+        # 最终验证：重新读取文件确认写入成功
+        with open(target_file, "r") as f:
+            verify_content = f.read()
+        verified_lines = [l.strip() for l in verify_content.split('\n')
+                         if 'bool allow_shell' in l]
+        if any('= true;' in l for l in verified_lines):
+            logger.info(f"Shell Root: ✓ 验证通过 → {verified_lines}")
+        else:
+            logger.error(f"Shell Root: ✗ 验证失败！文件写入后仍不包含 'bool allow_shell = true;'")
+            logger.error(f"  当前内容: {verified_lines}")
+
+        # 如果是 symlink，确认实际编译的文件也被修改
+        common_ksu = self.work_dir / "common/drivers/kernelsu"
+        if common_ksu.is_symlink():
+            real_ksu = common_ksu.resolve() / "ksu.c"
+            if real_ksu.exists():
+                with open(real_ksu, "r") as f:
+                    real_content = f.read()
+                if 'bool allow_shell = true;' in real_content:
+                    logger.info(f"  symlink 目标 {real_ksu} 同步确认 ✓")
+                else:
+                    logger.error(f"  symlink 目标 {real_ksu} 未同步！手动写入...")
+                    real_content = re.sub(
+                        r'bool allow_shell\s*=\s*IS_ENABLED\([^)]*\)\s*;',
+                        'bool allow_shell = true;', real_content)
+                    real_content = real_content.replace('bool allow_shell = false;', 'bool allow_shell = true;')
+                    with open(real_ksu, "w") as f:
+                        f.write(real_content)
+
+        # 清除 ccache 缓存，防止编译器使用旧的缓存结果
+        self._run_cmd("ccache -C 2>/dev/null || true", check=False)
+        logger.info("Shell Root: 已清除 ccache 缓存，确保重新编译")
+
+    def patch_faccessat_hook(self):
+        """修复 ksu_handle_faccessat 的类型不匹配 bug
+
+        SukiSU-Ultra builtin 分支的 ksu_handle_faccessat 使用 const char __user **，
+        但 SUSFS 的 fs/open.c 补丁传入的是 struct filename **。
+        strncpy_from_user 读内核指针 → -EFAULT → su 永远 not found。
+        ksu_handle_stat (>= 6.1) 已修复但 faccessat 遗漏了。
+        """
+        logger.info("=== 修复 ksu_handle_faccessat 类型不匹配 ===")
+
+        target_file = None
+        for search_dir in [
+            self.work_dir / "common/drivers/kernelsu",
+            self.work_dir / "KernelSU",
+        ]:
+            if not search_dir.exists():
+                continue
+            result = subprocess.run(
+                f"grep -rl --include='*.c' 'ksu_handle_faccessat' {search_dir} 2>/dev/null",
+                shell=True, capture_output=True, text=True)
+            files = [p for p in result.stdout.strip().split('\n')
+                     if p and 'sucompat' in p]
+            if files:
+                target_file = Path(files[0])
+                break
+
+        if not target_file:
+            logger.info("未找到 sucompat.c，跳过 faccessat 修复")
+            return
+
+        with open(target_file, "r") as f:
+            content = f.read()
+
+        # 检测是否已经使用正确的 struct filename ** 签名
+        if 'ksu_handle_faccessat(int *dfd, struct filename **' in content:
+            logger.info("ksu_handle_faccessat 已使用 struct filename **，无需修复")
+            return
+
+        # 旧的有 bug 的实现（使用 const char __user **）
+        old_func = (
+            'int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\n'
+            '             int *__unused_flags)\n'
+            '{\n'
+            '    char path[sizeof(su_path) + 1] = {0};\n'
+            '\n'
+            '    strncpy_from_user(path, *filename_user, sizeof(path));\n'
+            '\n'
+            '    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {\n'
+            '        if (current_chrooted())\n'
+            '        {\n'
+            '            pr_err("ksu_handle_faccessat: su found but NOT allowed! Because current process is running in chrooted environment\\n");\n'
+            '            return 0;\n'
+            '        }\n'
+            '        pr_info("ksu_handle_faccessat: su->sh!\\n");\n'
+            '        *filename_user = sh_user_path();\n'
+            '    }\n'
+            '\n'
+            '    return 0;\n'
+            '}'
+        )
+
+        # 修复后的实现（匹配 ksu_handle_stat 的风格，使用 struct filename **）
+        new_func = (
+            'int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,\n'
+            '             int *__unused_flags)\n'
+            '{\n'
+            '    if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL))\n'
+            '        return 0;\n'
+            '\n'
+            '    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path))))\n'
+            '        return 0;\n'
+            '\n'
+            '    if (current_chrooted())\n'
+            '    {\n'
+            '        pr_err("ksu_handle_faccessat: su found but NOT allowed! Because current process is running in chrooted environment\\n");\n'
+            '        return 0;\n'
+            '    }\n'
+            '    pr_info("ksu_handle_faccessat: su->sh!\\n");\n'
+            '    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));\n'
+            '    return 0;\n'
+            '}'
+        )
+
+        if old_func in content:
+            content = content.replace(old_func, new_func)
+            with open(target_file, "w") as f:
+                f.write(content)
+            logger.info("ksu_handle_faccessat: ✓ 已修复为 struct filename ** 签名")
+        else:
+            # 精确匹配失败，尝试用正则
+            logger.warning("精确匹配失败，尝试正则替换...")
+            pattern = re.compile(
+                r'int ksu_handle_faccessat\(int \*dfd, const char __user \*\*filename_user.*?\n\{.*?'
+                r'strncpy_from_user\(path, \*filename_user.*?\n'
+                r'.*?return 0;\s*\n\}',
+                re.DOTALL)
+            if pattern.search(content):
+                content = pattern.sub(new_func, content)
+                with open(target_file, "w") as f:
+                    f.write(content)
+                logger.info("ksu_handle_faccessat: ✓ 已通过正则修复为 struct filename ** 签名")
+            else:
+                logger.error("ksu_handle_faccessat: ✗ 无法匹配旧实现，请手动检查 sucompat.c")
+
+        # 同步修复 sucompat.h 中的声明
+        header_file = target_file.parent / "sucompat.h"
+        if header_file.exists():
+            with open(header_file, "r") as f:
+                header = f.read()
+            old_decl = 'int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);'
+            if old_decl in header:
+                new_decl = (
+                    '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && defined(CONFIG_KSU_SUSFS)\n'
+                    'int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);\n'
+                    '#else\n'
+                    'int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);\n'
+                    '#endif'
+                )
+                header = header.replace(old_decl, new_decl)
+                with open(header_file, "w") as f:
+                    f.write(header)
+                logger.info("sucompat.h: ✓ 已修复声明")
+            elif 'ksu_handle_faccessat(int *dfd, struct filename **' in header:
+                logger.info("sucompat.h: 声明已是最新，无需修复")
+            else:
+                logger.warning("sucompat.h: 未找到已知的 faccessat 声明")
+        else:
+            logger.warning(f"未找到 {header_file}，跳过头文件修复")
+
+        # 验证 .c 和 .h 一致性
+        with open(target_file, "r") as f:
+            verify = f.read()
+        if 'ksu_handle_faccessat(int *dfd, struct filename **' in verify:
+            logger.info("ksu_handle_faccessat (sucompat.c): ✓ 验证通过")
+        else:
+            logger.error("ksu_handle_faccessat (sucompat.c): ✗ 验证失败！")
+
+    def patch_throne_tracker(self):
+        """修复 throne_tracker 中 base.apk 前缀匹配 bug，避免 base.apk.prof 干扰管理器加冕"""
+        logger.info("=== 修复 throne_tracker base.apk 匹配 ===")
+
+        target_file = None
+        for search_dir in [
+            self.work_dir / "common/drivers/kernelsu",
+            self.work_dir / "KernelSU",
+        ]:
+            if not search_dir.exists():
+                continue
+            result = subprocess.run(
+                f"grep -rl --include='*.c' 'base.apk' {search_dir} 2>/dev/null",
+                shell=True, capture_output=True, text=True)
+            files = [p for p in result.stdout.strip().split('\n')
+                     if p and 'throne_tracker' in p]
+            if files:
+                target_file = Path(files[0])
+                break
+
+        if not target_file:
+            logger.info("未找到 throne_tracker.c，跳过")
+            return
+
+        with open(target_file, "r") as f:
+            content = f.read()
+
+        # 已经有 namelen == 8 精确匹配，无需修复
+        if 'namelen == 8' in content:
+            logger.info("throne_tracker 已使用精确匹配，无需修复")
+            return
+
+        # 修复：将前缀匹配改为精确匹配
+        # 旧代码: strncmp(name, "base.apk", 8) == 0  (无 namelen 检查)
+        # 匹配各种写法: !strncmp(name, "base.apk", 8) 或 strncmp(...) == 0
+        old_pattern = re.compile(
+            r'(!strncmp\(name,\s*"base\.apk",\s*8\))|'
+            r'(strncmp\(name,\s*"base\.apk",\s*8\)\s*==\s*0)|'
+            r'(strncmp\(name,\s*"base\.apk",\s*namelen\)\s*==\s*0)'
+        )
+        match = old_pattern.search(content)
+        if match:
+            old_expr = match.group(0)
+            new_expr = '(namelen == 8) && (strncmp(name, "base.apk", namelen) == 0)'
+            content = content.replace(old_expr, new_expr)
+            with open(target_file, "w") as f:
+                f.write(content)
+            logger.info(f"throne_tracker: 已将 '{old_expr}' 修复为精确匹配")
+        else:
+            logger.warning("throne_tracker: 未找到已知的前缀匹配模式，跳过")
             for line in content.split('\n'):
-                if 'allow_shell' in line:
-                    logger.warning(f"  找到相关行: {line.strip()}")
+                if 'base.apk' in line and 'strncmp' in line:
+                    logger.warning(f"  相关行: {line.strip()}")
 
     def add_bbg(self):
         if not self.config.use_bbg:
@@ -501,7 +722,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         MAX_CUSTOM_LEN = 48
         safe_custom_version = ""
         if self.config.custom_version:
-            safe_custom_version = self.config.custom_version.rstrip('-')[:MAX_CUSTOM_LEN]
+            # 只保留版本号安全字符：字母、数字、-、_、.
+            safe_custom_version = re.sub(r'[^a-zA-Z0-9\-_.]', '', self.config.custom_version.rstrip('-'))[:MAX_CUSTOM_LEN]
             logger.info(f"使用自定义构建版本: {safe_custom_version}")
         else:
             logger.info("使用默认构建版本")
@@ -522,16 +744,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         # 配置 custom_version（参照 ReSukiSu 的方式，用 sed 直接操作）
         if safe_custom_version:
             kv = self.config.kernel_version
-            if kv in ["5.10", "5.15"]:
-                # 5.x：旧格式 setlocalversion
-                self._run_cmd(
-                    f'''sed -i "\\$s|echo \\"\\$res\\"|echo \\"{safe_custom_version}\\"|" {setlocalversion}''',
-                    check=False)
-                self._run_cmd(
-                    f'''sed -i '/^CONFIG_LOCALVERSION=/ s/="[^"]*"/="{safe_custom_version}"/' {defconfig}''',
-                    check=False)
-            elif kv == "6.1":
-                # 6.1：旧格式 setlocalversion + CONFIG_LOCALVERSION
+            if kv in ["5.10", "5.15", "6.1"]:
+                # 5.x/6.1：旧格式 setlocalversion + CONFIG_LOCALVERSION
                 self._run_cmd(
                     f'''sed -i "\\$s|echo \\"\\$res\\"|echo \\"{safe_custom_version}\\"|" {setlocalversion}''',
                     check=False)
@@ -791,12 +1005,15 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.init_and_sync_kernel()
             self.add_kernel_supatch()
             self.add_kernelsu()
-            self.patch_shell_root()
             self.add_bbg()
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
+            # shell_root / throne_tracker / faccessat 补丁必须在所有 patch 之后，避免被 SUSFS 等补丁覆盖
+            self.patch_faccessat_hook()
+            self.patch_shell_root()
+            self.patch_throne_tracker()
             self.configure_kernel()
             self.configure_kernel_name()
             self.show_kernel_config()
