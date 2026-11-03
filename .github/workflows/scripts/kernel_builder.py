@@ -579,152 +579,85 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._chdir(common_dir)
                 result = self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}",
                                        check=False, capture_output=True)
-                patch_out = f"{result.stdout or ''}{result.stderr or ''}"
-                for line in patch_out.splitlines():
-                    low = line.lower()
-                    if "failed" in low or ".rej" in low or "can't find file" in low:
-                        logger.warning(f"  [patch] {line.strip()}")
-                rejects = list(common_dir.rglob("*.rej"))
+                rejects = sorted(str(p.relative_to(common_dir)) for p in common_dir.rglob("*.rej"))
                 if rejects:
-                    logger.warning("SUSFS 补丁存在被拒绝的 hunk: "
-                                   f"{[str(p.relative_to(common_dir)) for p in rejects[:10]]}")
+                    logger.warning(f"  SUSFS 补丁有 hunk 被拒绝: {rejects}")
+                    for line in f"{result.stdout or ''}{result.stderr or ''}".splitlines():
+                        if "failed" in line.lower():
+                            logger.warning(f"  [patch] {line.strip()}")
                 self._chdir(self.work_dir)
 
-    def patch_susfs_namespace_decls(self):
-        """补齐 fs/namespace.c 中被拒绝的 SUSFS 声明块
+    # 上游 50_add_susfs 补丁首个 hunk 的上下文含 `#include <trace/hooks/blk.h>`，
+    # 而 android14-6.1 树里没有该行；patch --fuzz 只能模糊 hunk 首尾，忽略不了中间上下文，
+    # 于是 include + extern 声明整块被拒（.rej），SUS_MOUNT 代码全报 undeclared identifier。
+    SUSFS_NS_BLOCK = (
+        "\n#ifdef CONFIG_KSU_SUSFS\n"
+        "#include <linux/susfs_def.h>\n"
+        "#endif // #ifdef CONFIG_KSU_SUSFS\n"
+        "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+        "extern bool susfs_is_current_ksu_domain(void);\n"
+        "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n"
+        "\n"
+        "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n"
+        "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+    )
+    SUSFS_NS_ANCHORS = ("#include <linux/mnt_idmapping.h>",
+                        "#include <linux/shmem_fs.h>",
+                        '#include "internal.h"')
 
-        上游 50_add_susfs 补丁首个 hunk 的上下文包含 `#include <trace/hooks/blk.h>`，
-        部分 GKI 快照（如 android14-6.1 的 2025-02 版本）没有该行；
-        patch --fuzz 只能模糊首尾上下文，无法忽略 hunk 中间的上下文行，
-        于是整块 include + extern 声明被拒（.rej），后续 CONFIG_KSU_SUSFS_SUS_MOUNT
-        代码全部报 undeclared identifier。
-        """
-        logger.info("=== 校验 fs/namespace.c 的 SUSFS 声明 ===")
+    def patch_susfs_namespace_decls(self):
+        """补回 fs/namespace.c 中被拒绝的 SUSFS 声明块（幂等：已有 susfs_def.h 即跳过）"""
         ns = self.work_dir / "common/fs/namespace.c"
         if not ns.exists():
-            logger.info("未找到 fs/namespace.c，跳过")
             return
-
         content = ns.read_text()
-        suspicious = any(sym in content for sym in (
-            "VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT",
-            "DEFAULT_KSU_MNT_ID",
-            "susfs_is_current_proc_umounted(",
-        ))
-        if not suspicious or "susfs_def.h" in content:
+        if "susfs_def.h" in content or "VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT" not in content:
             logger.info("fs/namespace.c: SUSFS 声明完整，无需修复")
             return
-
-        block = (
-            "\n"
-            "#ifdef CONFIG_KSU_SUSFS\n"
-            "#include <linux/susfs_def.h>\n"
-            "#endif // #ifdef CONFIG_KSU_SUSFS\n"
-            "\n"
-            "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
-            "extern bool susfs_is_current_ksu_domain(void);\n"
-            "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n"
-            "\n"
-            "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n"
-            "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
-        )
-
-        inserted = False
-        for anchor in ("#include <linux/mnt_idmapping.h>",
-                       "#include <linux/shmem_fs.h>",
-                       '#include "internal.h"'):
-            idx = content.find(anchor)
-            if idx != -1:
-                end = idx + len(anchor)
-                ns.write_text(content[:end] + block + content[end:])
-                logger.info(f"fs/namespace.c: 已在 {anchor} 之后补齐 SUSFS 声明块")
-                content = ns.read_text()
-                inserted = True
+        for anchor in self.SUSFS_NS_ANCHORS:
+            if anchor in content:
+                ns.write_text(content.replace(anchor, anchor + self.SUSFS_NS_BLOCK, 1))
+                logger.info(f"fs/namespace.c: 已在 {anchor} 后补齐 SUSFS 声明块")
                 break
-
-        if not inserted:
-            logger.error("fs/namespace.c: 未找到合适的插入锚点，请手动检查（构建很可能失败）")
-            return
-
-        missing = [key for key in ("#include <linux/susfs_def.h>",
-                                   "CL_COPY_MNT_NS",
-                                   "susfs_is_current_ksu_domain")
-                   if key not in content]
-        if missing:
-            logger.error(f"fs/namespace.c: 补齐后仍缺少 {missing}")
         else:
-            logger.info("fs/namespace.c: ✓ SUSFS 声明补齐完成")
+            logger.warning("fs/namespace.c: 未找到插入锚点，跳过（构建可能失败）")
+            return
+        ok = "susfs_def.h" in ns.read_text()
+        logger.info(f"fs/namespace.c: {'✓ 声明齐全' if ok else '✗ 仍缺少 susfs_def.h'}")
 
     def patch_priority_uid_filter_calls(self):
-        """给 SukiSU 中无条件调用的 priority uid filter API 补编译守卫
+        """补 priority uid filter 调用守卫（特性开启时行为不变，未开启时安全跳过）
 
-        SukiSU 新版在 dispatch.c / pkg_observer.c 里直接调用
-        susfs_set_priority_uid_filter() / susfs_parse_priority_app_strings()，
-        但 SUSFS 只在 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y 时才声明并实现它们，
-        未启用该特性时会出现 use of undeclared identifier。
-        这里补上同名守卫：特性开启时行为不变，未开启时安全跳过。
+        SukiSU 无条件调用 susfs_set_priority_uid_filter() / susfs_parse_priority_app_strings()，
+        但 SUSFS 只在 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y 时才声明实现它们。
         """
-        logger.info("=== 补齐 priority uid filter 调用守卫 ===")
         guard = "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER"
-        guard_end = "#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER"
-        marker = "case CMD_SUSFS_SET_PRIORITY_UID_FILTER:"
-        call = "susfs_parse_priority_app_strings();"
-
-        candidates = []
+        patterns = (
+            # dispatch.c: case CMD_SUSFS_SET_PRIORITY_UID_FILTER: ... return 0;
+            re.compile(r"(?m)^([ \t]*)case CMD_SUSFS_SET_PRIORITY_UID_FILTER:\n"
+                       r"(?:[ \t]+[^\n]*\n)*?[ \t]*return[^\n]*\n"),
+            # pkg_observer.c: susfs_parse_priority_app_strings();
+            re.compile(r"(?m)^([ \t]*)(susfs_parse_priority_app_strings\(\);\n)"),
+        )
+        paths = []
         for base in (self.work_dir / "common/drivers/kernelsu", self.work_dir / "KernelSU"):
             if base.exists():
-                candidates += [base / "supercall/dispatch.c", base / "manager/pkg_observer.c"]
+                paths += [base / "supercall/dispatch.c", base / "manager/pkg_observer.c"]
 
-        seen, changed = set(), 0
-        for path in candidates:
-            if not path.exists():
+        fixed = 0
+        for path in {p.resolve() for p in paths if p.exists()}:
+            text = read = path.read_text()
+            if guard in read:
                 continue
-            real = path.resolve()
-            if real in seen:
-                continue
-            seen.add(real)
-
-            lines = real.read_text().split("\n")
-            out, i, modified = [], 0, False
-            while i < len(lines):
-                line = lines[i]
-                indent = line[:len(line) - len(line.lstrip())]
-                prev = next((l.strip() for l in reversed(out) if l.strip()), "")
-
-                if marker in line and prev != guard:
-                    out.append(indent + guard)
-                    while i < len(lines):
-                        out.append(lines[i])
-                        done = "return" in lines[i]
-                        i += 1
-                        if done:
-                            break
-                    out.append(indent + guard_end)
-                    modified = True
-                    continue
-
-                if call in line and prev != guard:
-                    out.append(indent + guard)
-                    out.append(line)
-                    out.append(indent + guard_end)
-                    modified = True
-                    i += 1
-                    continue
-
-                out.append(line)
-                i += 1
-
-            if modified:
-                real.write_text("\n".join(out))
-                changed += 1
-                logger.info(f"  {real}: 已补编译守卫")
-            else:
-                logger.info(f"  {real}: 无需修改")
-
-        if changed:
-            logger.info(f"priority uid filter: ✓ 已处理 {changed} 个文件")
-        else:
-            logger.info("priority uid filter: 未发现需要补守卫的调用")
+            for pattern in patterns:
+                text = pattern.sub(
+                    lambda m: f"{m.group(1)}{guard}\n{m.group(0)}{m.group(1)}#endif // {guard}\n",
+                    text)
+            if text != read:
+                path.write_text(text)
+                fixed += 1
+                logger.info(f"  {path.name}: 已补编译守卫")
+        logger.info("priority uid filter: " + (f"✓ 已处理 {fixed} 个文件" if fixed else "无需修改"))
 
     def apply_sukisu_patches(self):
         logger.info("=== 应用 SukiSU 补丁 ===")
